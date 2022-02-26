@@ -174,7 +174,7 @@ impl Session {
         .await
     }
 
-    fn message_key<'a>(room: &'a str, dt: DateTime) -> (&'a str, &'a str, &'a str, String) {
+    fn message_key(room: &str, dt: DateTime) -> (&str, &str, &str, String) {
         (
             "rooms",
             room,
@@ -183,16 +183,23 @@ impl Session {
         )
     }
 
+    fn message_recent_key(room: &str) -> (&str, &str, &str) {
+        ("rooms", room, "most_recent_message")
+    }
+
     pub async fn write(&self, dt: DateTime, message: &str) -> AnyResult<()> {
-        let key = Session::message_key(&self.room, dt);
+        let message_key = Session::message_key(&self.room, dt);
+        let dt_key = message_key.3.as_ref();
+        let recent_key = Session::message_recent_key(&self.room);
 
         let result = self
             .db
             .transact_boxed_local(
-                (key, message),
-                |tx, (key, message)| {
+                (pack(&message_key), pack(&recent_key), dt_key, message),
+                |tx, (message_key, recent_key, dt_key, message)| {
                     async move {
-                        tx.set(&pack(key), message.as_bytes());
+                        tx.set(message_key, message.as_bytes());
+                        tx.set(recent_key, dt_key);
                         Ok(())
                     }
                     .boxed_local()
@@ -211,11 +218,7 @@ impl Session {
 
         let kvs = self
             .db
-            .transact_boxed_local(
-                &r,
-                |tx, r| tx.get_range(&r, 1, true).boxed_local(),
-                ChatOpts,
-            )
+            .transact_boxed_local(r, |tx, r| tx.get_range(r, 1, true).boxed_local(), ChatOpts)
             .await?;
 
         let messages: AnyResult<Vec<(DateTime, String)>> = kvs
