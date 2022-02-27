@@ -10,7 +10,9 @@ use foundationdb::tuple::{pack, unpack, Subspace};
 use foundationdb::{Database, FdbError, FdbResult, KeySelector, RangeOption, Transaction};
 use futures::future::select;
 use futures::Future;
-use futures::{future::FutureExt, pin_mut};
+use futures::{future::Either, future::FutureExt, pin_mut, stream::StreamExt};
+use signal_hook::consts::signal::*;
+use signal_hook_async_std::Signals;
 use uuid::Uuid;
 
 type DateTime = chrono::DateTime<chrono::Utc>;
@@ -353,7 +355,7 @@ struct Args {
     clear: bool,
 }
 
-async fn message_print_loop(session: &Session) -> AnyResult<()> {
+async fn message_print_loop(session: &Session) -> anyhow::Result<()> {
     let mut iter = MessageIter::new(session, None);
 
     loop {
@@ -362,7 +364,7 @@ async fn message_print_loop(session: &Session) -> AnyResult<()> {
     }
 }
 
-async fn send_loop(session: &Session) -> AnyResult<()> {
+async fn send_loop(session: &Session) -> anyhow::Result<()> {
     let mut input = Input::new();
 
     loop {
@@ -376,7 +378,52 @@ async fn send_loop(session: &Session) -> AnyResult<()> {
     }
 }
 
-async fn main_loop() -> AnyResult<()> {
+// async fn handle_signals(mut signals: Signals) {
+//     while let Some(signal) = signals.next().await {
+//         match signal {
+//             SIGHUP => {
+//                 // Reload configuration
+//                 // Reopen the log file
+//             }
+//             SIGTERM | SIGINT | SIGQUIT => {
+//                 // Shutdown the system;
+//             },
+//             _ => unreachable!(),
+//         }
+//     }
+// }
+
+async fn signal_loop() -> anyhow::Result<()> {
+    let mut signals = Signals::new(&[SIGHUP, SIGTERM, SIGINT, SIGQUIT])?;
+    let handle = signals.handle();
+
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGHUP => {
+                log::warn!("Received SIGHUP, exiting.");
+                break;
+            }
+            SIGTERM => {
+                log::warn!("Received SIGTERM, exiting.");
+                break;
+            }
+            SIGINT => {
+                log::info!("Received SIGINT, exiting.");
+                break;
+            }
+            SIGQUIT => {
+                log::warn!("Received SIGQUIT, exiting.");
+                break;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    handle.close();
+    Ok(())
+}
+
+async fn main_loop() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut builder = env_logger::Builder::from_env("LOGLEVEL");
     match args.debug {
@@ -400,10 +447,18 @@ async fn main_loop() -> AnyResult<()> {
     {
         let sender = send_loop(&session);
         let receiver = message_print_loop(&session);
+        let signals = signal_loop();
         pin_mut!(sender);
         pin_mut!(receiver);
+        pin_mut!(signals);
 
-        select(sender, receiver).await.factor_first().0?;
+        match select(signals, select(sender, receiver)).await {
+            // Got a signal, so we're done
+            Either::Left((signal_result, _other_future)) => signal_result?,
+            // Either sender or receiver returned, so we take the first of the
+            // two and short-circuit on the error
+            Either::Right((inner, _other_future)) => inner.factor_first().0?,
+        }
     };
 
     session.leave().await?;
@@ -412,7 +467,7 @@ async fn main_loop() -> AnyResult<()> {
 }
 
 #[async_std::main]
-async fn main() -> AnyResult<()> {
+async fn main() -> anyhow::Result<()> {
     let network = unsafe { foundationdb::boot() };
 
     let result = main_loop().await;
