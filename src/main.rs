@@ -118,15 +118,6 @@ impl Session {
     async fn init(db: Arc<Database>, room: String, username: String) -> AnyResult<Self> {
         let id = Uuid::new_v4();
 
-        // db.transact_boxed(
-        //     (room.as_ref(), username.as_ref()),
-        //     move |tx: &Transaction, (room, username)| {
-        //         Session::init_tx(tx, room, username).boxed()
-        //     },
-        //     ChatOpts,
-        // )
-        // .await?;
-
         db.transact_boxed_local(
             (room.as_ref(), username.as_ref()),
             move |tx: &Transaction, (room, username)| {
@@ -176,7 +167,6 @@ impl Session {
         if dbid != id {
             return Err(anyhow::format_err!("Unexpected ID").into());
         }
-        // self.db.transact_boxed_local(data, f, options)
 
         tx.clear(&keyp);
 
@@ -362,7 +352,6 @@ pub struct MessageIter<'a> {
     session: &'a Session,
     last: Option<DateTime>,
     waiting: VecDeque<(DateTime, String)>,
-    // watch: Option<Box<impl Future<Output = AnyResult<()>>>>,
 }
 
 impl<'a> MessageIter<'a> {
@@ -383,8 +372,14 @@ impl<'a> MessageIter<'a> {
         let messages = loop {
             let msg_res = self.session.messages_or_watch(self.last, Some(3)).await?;
             match msg_res {
-                Ok(v) => break v,
-                Err(w) => w.await?,
+                Ok(v) => {
+                    log::info!("MessageIter: Got {} messages", v.len());
+                    break v;
+                }
+                Err(w) => {
+                    log::info!("MessageIter: Waiting");
+                    w.await?
+                }
             }
         };
         self.waiting.extend(messages);
@@ -409,6 +404,9 @@ struct Args {
 
     #[clap(short, long)]
     room: String,
+
+    #[clap(short, long, parse(from_occurrences))]
+    debug: usize,
 
     #[clap(long)]
     clear: bool,
@@ -439,6 +437,17 @@ async fn send_loop(session: &Session) -> AnyResult<()> {
 
 async fn main_loop() -> AnyResult<()> {
     let args = Args::parse();
+    let mut builder = env_logger::Builder::from_env("LOGLEVEL");
+    match args.debug {
+        0 => {}
+        1 => {
+            builder.filter_level(log::LevelFilter::Info);
+        }
+        _ => {
+            builder.filter_level(log::LevelFilter::Debug);
+        }
+    }
+    builder.init();
 
     let db = Arc::new(foundationdb::Database::default()?);
 

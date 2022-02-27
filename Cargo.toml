@@ -10,8 +10,10 @@ anyhow = "1.0.41"
 async-std = {version = "1.10.0", features = ["attributes"]}
 chrono = "0.4.19"
 clap = {version = "3.1.0", features = ["derive"]}
+env_logger = "0.9.0"
 foundationdb = "0.5"
 futures = "0.3"
+log = "0.4.14"
 nom = "7.1"
 serde = "1.0.126"
 uuid = {version = "0.8", features = ["v4"]}
