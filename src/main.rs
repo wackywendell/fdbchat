@@ -1,17 +1,19 @@
-use std::any::{self, Any};
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::str::from_utf8;
 use std::sync::Arc;
-use std::{fmt::format, slice::SliceIndex};
 
 use anyhow::Context;
 use async_std::io;
 use clap::Parser;
+use foundationdb::future::{FdbKeyValue, FdbValues};
 use foundationdb::tuple::{pack, unpack, Subspace};
-use foundationdb::{Database, FdbError, FdbResult, RangeOption, Transaction};
+use foundationdb::{Database, FdbError, FdbResult, KeySelector, RangeOption, Transaction};
+use futures::future::select;
+use futures::Future;
 use futures::{
     future::FutureExt, // for `.fuse()`
-    select,
+    pin_mut,
 };
 use uuid::Uuid;
 
@@ -57,7 +59,7 @@ impl foundationdb::TransactError for AnyErr {
     }
 }
 
-const ChatOpts: foundationdb::TransactOption = foundationdb::TransactOption {
+const CHAT_OPTS: foundationdb::TransactOption = foundationdb::TransactOption {
     retry_limit: Some(3),
     time_out: None,
     is_idempotent: false,
@@ -95,6 +97,10 @@ impl Session {
         ("rooms", room, "users", username)
     }
 
+    fn date_string(dt: DateTime) -> String {
+        dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
     async fn init_tx(tx: &Transaction, room: &str, username: &str) -> AnyResult<()> {
         // let key = foundationdb::tuple::pack(&("rooms", room, "users", username));
         let key = Session::user_key(room, username);
@@ -126,7 +132,7 @@ impl Session {
             move |tx: &Transaction, (room, username)| {
                 Session::init_tx(tx, room, username).boxed_local()
             },
-            ChatOpts,
+            CHAT_OPTS,
         )
         .await?;
 
@@ -136,6 +142,21 @@ impl Session {
             username,
             id: Some(id),
         })
+    }
+
+    pub async fn clear(&self) -> FdbResult<()> {
+        let space = Subspace::from(&("rooms", &self.room, "messages"));
+
+        self.db
+            .transact_boxed_local(
+                space,
+                |tx, space| {
+                    tx.clear_subspace_range(space);
+                    futures::future::ready(Ok(())).boxed_local()
+                },
+                CHAT_OPTS,
+            )
+            .await
     }
 
     async fn leave_tx(&mut self, tx: &Transaction) -> AnyResult<()> {
@@ -169,18 +190,13 @@ impl Session {
         db.transact_boxed_local(
             &mut self,
             |tx: &Transaction, slf| slf.leave_tx(tx).boxed_local(),
-            ChatOpts,
+            CHAT_OPTS,
         )
         .await
     }
 
     fn message_key(room: &str, dt: DateTime) -> (&str, &str, &str, String) {
-        (
-            "rooms",
-            room,
-            "messages",
-            dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        )
+        ("rooms", room, "messages", Session::date_string(dt))
     }
 
     fn message_recent_key(room: &str) -> (&str, &str, &str) {
@@ -192,8 +208,7 @@ impl Session {
         let dt_key = message_key.3.as_ref();
         let recent_key = Session::message_recent_key(&self.room);
 
-        let result = self
-            .db
+        self.db
             .transact_boxed_local(
                 (pack(&message_key), pack(&recent_key), dt_key, message),
                 |tx, (message_key, recent_key, dt_key, message)| {
@@ -204,82 +219,186 @@ impl Session {
                     }
                     .boxed_local()
                 },
-                ChatOpts,
+                CHAT_OPTS,
             )
-            .await;
-
-        result
+            .await
     }
 
-    pub async fn read_all(&self) -> AnyResult<Vec<(DateTime, String)>> {
+    pub async fn read_all_and_watch(
+        &self,
+        last: Option<DateTime>,
+    ) -> AnyResult<(Vec<(DateTime, String)>, impl Future<Output = FdbResult<()>>)> {
+        let space = Subspace::from(&("rooms", &self.room, "messages"));
+        let recent_key = Session::message_recent_key(&self.room);
+
+        let r: RangeOption = match last {
+            None => RangeOption::from(&space),
+            Some(dt) => {
+                let (_begin, end) = space.range();
+                let last_key = pack(&Session::message_key(&self.room, dt));
+                let ks = KeySelector::first_greater_than(last_key);
+                RangeOption::from((ks, KeySelector::first_greater_or_equal(end)))
+            }
+        };
+
+        let (kvs, watch) = self
+            .db
+            .transact_boxed_local::<_, _, _, FdbError>(
+                (r, pack(&recent_key)),
+                |tx, (r, recent_key)| {
+                    async move {
+                        let kvs = tx.get_range(r, 1, true).await?;
+
+                        let watch = tx.watch(recent_key);
+
+                        Ok((kvs, watch))
+                    }
+                    .boxed_local()
+                },
+                CHAT_OPTS,
+            )
+            .await?;
+
+        let messages: Vec<(DateTime, String)> = kvs
+            .iter()
+            .map(Session::parse_kv)
+            .collect::<AnyResult<_>>()?;
+
+        Ok((messages, watch))
+    }
+
+    pub async fn read_all(&self, last: Option<DateTime>) -> AnyResult<Vec<(DateTime, String)>> {
         let space = Subspace::from(&("rooms", &self.room, "messages"));
 
-        let r = RangeOption::from(&space);
+        let r: RangeOption = match last {
+            None => RangeOption::from(&space),
+            Some(dt) => {
+                let (_begin, end) = space.range();
+                let last_key = pack(&Session::message_key(&self.room, dt));
+                let ks = KeySelector::first_greater_than(last_key);
+                RangeOption::from((ks, KeySelector::first_greater_or_equal(end)))
+            }
+        };
 
         let kvs = self
             .db
-            .transact_boxed_local(r, |tx, r| tx.get_range(r, 1, true).boxed_local(), ChatOpts)
+            .transact_boxed_local::<_, _, _, FdbError>(
+                r,
+                |tx, r| tx.get_range(r, 1, true).boxed_local(),
+                CHAT_OPTS,
+            )
             .await?;
 
-        let messages: AnyResult<Vec<(DateTime, String)>> = kvs
-            .iter()
-            .map(|kv| {
-                let k = from_utf8(kv.key()).context("Converting key");
-                let k = k
-                    .and_then(|k| {
-                        chrono::DateTime::parse_from_rfc3339(k)
-                            .map(DateTime::from)
-                            .context("Parsing date")
-                    })
-                    .context("Parsing key");
-                k.and_then(|k| {
-                    from_utf8(kv.value())
-                        .context("Converting value")
-                        .map(|v| (k, str::to_string(v)))
-                })
-                .map_err(AnyErr::from)
-            })
-            .collect();
+        kvs.iter().map(Session::parse_kv).collect::<AnyResult<_>>()
+    }
 
-        messages
+    /// messages_or_watch returns a list of messages, or if none are available, a watch that will
+    /// trigger when at least one message is available.
+    ///
+    /// last: If None, start with the first message; otherwise, start after this message.
+    /// limit: if None, returns all waiting messages; otherwise, returns up to limit messages.
+    pub async fn messages_or_watch(
+        &self,
+        last: Option<DateTime>,
+        limit: Option<usize>,
+    ) -> AnyResult<Result<Vec<(DateTime, String)>, impl Future<Output = FdbResult<()>>>> {
+        let space = Subspace::from(&("rooms", &self.room, "messages"));
+        let recent_key = Session::message_recent_key(&self.room);
+
+        let mut r: RangeOption = match last {
+            None => RangeOption::from(&space),
+            Some(dt) => {
+                let (_begin, end) = space.range();
+                let last_key = pack(&Session::message_key(&self.room, dt));
+                let ks = KeySelector::first_greater_than(last_key);
+                RangeOption::from((ks, KeySelector::first_greater_or_equal(end)))
+            }
+        };
+
+        r.limit = limit;
+
+        let kvs: Result<FdbValues, _> = self
+            .db
+            .transact_boxed_local::<_, _, _, FdbError>(
+                (&r, pack(&recent_key)),
+                |tx, (r, recent_key)| {
+                    async move {
+                        let kvs = tx.get_range(r, 1, false).await;
+                        match kvs {
+                            Err(e) => Err(e),
+                            Ok(kv) if kv.is_empty() => Ok(Err(tx.watch(recent_key))),
+                            Ok(kv) => Ok(Ok(kv)),
+                        }
+                    }
+                    .boxed_local()
+                },
+                CHAT_OPTS,
+            )
+            .await?;
+
+        match kvs {
+            Ok(kvs) => kvs
+                .iter()
+                .map(Session::parse_kv)
+                .collect::<AnyResult<Vec<_>>>()
+                .map(Ok),
+            Err(w) => Ok(Err(w)),
+        }
+    }
+
+    fn parse_kv(kv: &FdbKeyValue) -> AnyResult<(DateTime, String)> {
+        let (_, _, _, kdt): (String, String, String, String) =
+            unpack(kv.key()).context("Unpacking")?;
+        let fixed_dt = chrono::DateTime::parse_from_rfc3339(&kdt).context("Parsing date")?;
+        let dt = DateTime::from(fixed_dt);
+
+        let msg = str::to_string(from_utf8(kv.value()).context("Parsing date")?);
+
+        Ok((dt, msg))
     }
 }
 
-async fn hello_world_tx(tx: &Transaction, h: &str, w: &str) -> FdbResult<()> {
-    tx.set(b"hello", b"world");
-
-    Ok(())
+pub struct MessageIter<'a> {
+    session: &'a Session,
+    last: Option<DateTime>,
+    waiting: VecDeque<(DateTime, String)>,
+    // watch: Option<Box<impl Future<Output = AnyResult<()>>>>,
 }
 
-async fn hello_world() -> FdbResult<()> {
-    let db = Database::default()?;
+impl<'a> MessageIter<'a> {
+    pub fn new(session: &'a Session, last: Option<DateTime>) -> Self {
+        MessageIter {
+            session,
+            last,
+            waiting: VecDeque::new(),
+        }
+    }
 
-    // write a value
-    // let tx = db.create_tx()?;
-    // tx.set(b"hello", b"world"); // errors will be returned in the future result
-    // tx.commit().await?;
+    pub async fn next(&mut self) -> AnyResult<(DateTime, String)> {
+        if let Some(dm) = self.waiting.pop_front() {
+            return Ok(dm);
+        }
 
-    let (h, w) = ("hello", "world");
+        // None left in the past; let's see if any are waiting, and wait if they are
+        let messages = loop {
+            let msg_res = self.session.messages_or_watch(self.last, Some(3)).await?;
+            match msg_res {
+                Ok(v) => break v,
+                Err(w) => w.await?,
+            }
+        };
+        self.waiting.extend(messages);
 
-    db.transact_boxed_local(
-        (h, w),
-        move |tx, (h, w)| hello_world_tx(tx, h, w).boxed_local(),
-        ChatOpts,
-    )
-    .await?;
+        let (last_dt, _) = self.waiting.back().expect("Messages expected after watch");
+        self.last = Some(*last_dt);
 
-    // read a value
-    let tx = db.create_trx()?;
-    let maybe_value = tx.get(b"hello", false).await?;
-    let value = maybe_value.unwrap(); // unwrap the option
+        let msg = self
+            .waiting
+            .pop_front()
+            .expect("Really expected a front message after waiting for watch and extending");
 
-    assert_eq!(b"world", &value.as_ref());
-
-    Ok(())
-}
-
-async fn send_message(s: &str) {
-    println!("Got line {}", s);
+        Ok(msg)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -290,38 +409,60 @@ struct Args {
 
     #[clap(short, long)]
     room: String,
+
+    #[clap(long)]
+    clear: bool,
 }
 
-async fn main_loop() -> anyhow::Result<()> {
+async fn message_print_loop(session: &Session) -> AnyResult<()> {
+    let mut iter = MessageIter::new(session, None);
+
+    loop {
+        let (dt, msg) = iter.next().await?;
+        println!("{}: {}", dt, msg);
+    }
+}
+
+async fn send_loop(session: &Session) -> AnyResult<()> {
+    let mut input = Input::new();
+
+    loop {
+        let line = input.next().await.context("Failed getting input line")?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let now = chrono::Utc::now();
+        session.write(now, line).await?;
+    }
+}
+
+async fn main_loop() -> AnyResult<()> {
     let args = Args::parse();
 
     let db = Arc::new(foundationdb::Database::default()?);
 
     let session = Session::init(db, args.room, args.username).await?;
-
-    let mut input = Input::new();
-
-    loop {
-        let sent = async {
-            let line = input.next().await;
-            match line {
-                Ok(l) => {
-                    send_message(&l).await;
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        };
-
-        let mut next_line = Box::pin(sent.fuse());
-        select! {
-            found = next_line => found?,
-        }
+    if args.clear {
+        session.clear().await?;
     }
+
+    {
+        let sender = send_loop(&session);
+        let receiver = message_print_loop(&session);
+        pin_mut!(sender);
+        pin_mut!(receiver);
+
+        select(sender, receiver).await.factor_first().0?;
+    };
+
+    session.leave().await?;
+
+    Ok(())
 }
 
 #[async_std::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> AnyResult<()> {
     let network = unsafe { foundationdb::boot() };
 
     let result = main_loop().await;
