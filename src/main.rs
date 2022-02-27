@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt::Display;
 use std::str::from_utf8;
-use std::sync::Arc;
 
 use anyhow::Context;
 use async_std::io;
@@ -11,14 +10,15 @@ use foundationdb::tuple::{pack, unpack, Subspace};
 use foundationdb::{Database, FdbError, FdbResult, KeySelector, RangeOption, Transaction};
 use futures::future::select;
 use futures::Future;
-use futures::{
-    future::FutureExt, // for `.fuse()`
-    pin_mut,
-};
+use futures::{future::FutureExt, pin_mut};
 use uuid::Uuid;
 
 type DateTime = chrono::DateTime<chrono::Utc>;
 
+/// A wrapper error for FoundationDB errors OR any other error.
+///
+/// This error implements foundationdb::TransactError so that FoundationDB
+/// errors can be retried and other errors can be passed through.
 #[derive(Debug)]
 pub enum AnyErr {
     Any(anyhow::Error),
@@ -86,7 +86,7 @@ impl Input {
 }
 
 pub struct Session {
-    db: Arc<foundationdb::Database>,
+    db: foundationdb::Database,
     room: String,
     username: String,
     id: Option<Uuid>,
@@ -101,27 +101,31 @@ impl Session {
         dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
-    async fn init_tx(tx: &Transaction, room: &str, username: &str) -> AnyResult<()> {
-        // let key = foundationdb::tuple::pack(&("rooms", room, "users", username));
+    async fn init_tx(tx: &Transaction, room: &str, username: &str, uuid: Uuid) -> AnyResult<()> {
         let key = Session::user_key(room, username);
-        let val = tx.get(&pack(&key), true).await?;
+        let val = tx.get(&pack(&key), false).await?;
 
-        if let Some(u) = val {
-            return Err(
-                anyhow::format_err!("Key {:?} already taken: {:?}", key, u.as_ref()).into(),
-            );
+        if let Some(_taken_id) = val {
+            return Err(anyhow::format_err!(
+                "Username {} already taken in room {}!",
+                username,
+                room
+            )
+            .into());
         };
+
+        tx.set(&pack(&key), &pack(&uuid));
 
         Ok(())
     }
 
-    async fn init(db: Arc<Database>, room: String, username: String) -> AnyResult<Self> {
+    async fn init(db: Database, room: String, username: String) -> AnyResult<Self> {
         let id = Uuid::new_v4();
 
         db.transact_boxed_local(
             (room.as_ref(), username.as_ref()),
             move |tx: &Transaction, (room, username)| {
-                Session::init_tx(tx, room, username).boxed_local()
+                Session::init_tx(tx, room, username, id).boxed_local()
             },
             CHAT_OPTS,
         )
@@ -135,27 +139,22 @@ impl Session {
         })
     }
 
-    pub async fn clear(&self) -> FdbResult<()> {
-        let space = Subspace::from(&("rooms", &self.room, "messages"));
+    pub async fn clear(db: &Database, room: &str) -> FdbResult<()> {
+        let space = Subspace::from(&("rooms", &room));
 
-        self.db
-            .transact_boxed_local(
-                space,
-                |tx, space| {
-                    tx.clear_subspace_range(space);
-                    futures::future::ready(Ok(())).boxed_local()
-                },
-                CHAT_OPTS,
-            )
-            .await
+        db.transact_boxed_local(
+            space,
+            |tx, space| {
+                tx.clear_subspace_range(space);
+                futures::future::ready(Ok(())).boxed_local()
+            },
+            CHAT_OPTS,
+        )
+        .await
     }
 
-    async fn leave_tx(&mut self, tx: &Transaction) -> AnyResult<()> {
-        let id = match self.id {
-            None => return Ok(()),
-            Some(v) => v,
-        };
-        let key = ("rooms", &self.room, "users", &self.username);
+    async fn leave_tx(tx: &Transaction, id: Uuid, room: &str, username: &str) -> AnyResult<()> {
+        let key = ("rooms", room, "users", username);
         let keyp = pack(&key);
         let val = tx.get(&keyp, true).await?;
 
@@ -170,16 +169,26 @@ impl Session {
 
         tx.clear(&keyp);
 
-        self.id = None;
-
         Ok(())
     }
 
-    pub async fn leave(mut self) -> AnyResult<()> {
-        let db = self.db.clone();
+    /// Leave the chat room and close the session.
+    pub async fn leave(self) -> AnyResult<()> {
+        let Session {
+            db,
+            room,
+            username,
+            id,
+        } = self;
+        let id = match id {
+            None => return Ok(()),
+            Some(id) => id,
+        };
         db.transact_boxed_local(
-            &mut self,
-            |tx: &Transaction, slf| slf.leave_tx(tx).boxed_local(),
+            (room, username, id),
+            |tx: &Transaction, (room, username, id)| {
+                Session::leave_tx(tx, *id, room, username).boxed_local()
+            },
             CHAT_OPTS,
         )
         .await
@@ -212,74 +221,6 @@ impl Session {
                 CHAT_OPTS,
             )
             .await
-    }
-
-    pub async fn read_all_and_watch(
-        &self,
-        last: Option<DateTime>,
-    ) -> AnyResult<(Vec<(DateTime, String)>, impl Future<Output = FdbResult<()>>)> {
-        let space = Subspace::from(&("rooms", &self.room, "messages"));
-        let recent_key = Session::message_recent_key(&self.room);
-
-        let r: RangeOption = match last {
-            None => RangeOption::from(&space),
-            Some(dt) => {
-                let (_begin, end) = space.range();
-                let last_key = pack(&Session::message_key(&self.room, dt));
-                let ks = KeySelector::first_greater_than(last_key);
-                RangeOption::from((ks, KeySelector::first_greater_or_equal(end)))
-            }
-        };
-
-        let (kvs, watch) = self
-            .db
-            .transact_boxed_local::<_, _, _, FdbError>(
-                (r, pack(&recent_key)),
-                |tx, (r, recent_key)| {
-                    async move {
-                        let kvs = tx.get_range(r, 1, true).await?;
-
-                        let watch = tx.watch(recent_key);
-
-                        Ok((kvs, watch))
-                    }
-                    .boxed_local()
-                },
-                CHAT_OPTS,
-            )
-            .await?;
-
-        let messages: Vec<(DateTime, String)> = kvs
-            .iter()
-            .map(Session::parse_kv)
-            .collect::<AnyResult<_>>()?;
-
-        Ok((messages, watch))
-    }
-
-    pub async fn read_all(&self, last: Option<DateTime>) -> AnyResult<Vec<(DateTime, String)>> {
-        let space = Subspace::from(&("rooms", &self.room, "messages"));
-
-        let r: RangeOption = match last {
-            None => RangeOption::from(&space),
-            Some(dt) => {
-                let (_begin, end) = space.range();
-                let last_key = pack(&Session::message_key(&self.room, dt));
-                let ks = KeySelector::first_greater_than(last_key);
-                RangeOption::from((ks, KeySelector::first_greater_or_equal(end)))
-            }
-        };
-
-        let kvs = self
-            .db
-            .transact_boxed_local::<_, _, _, FdbError>(
-                r,
-                |tx, r| tx.get_range(r, 1, true).boxed_local(),
-                CHAT_OPTS,
-            )
-            .await?;
-
-        kvs.iter().map(Session::parse_kv).collect::<AnyResult<_>>()
     }
 
     /// messages_or_watch returns a list of messages, or if none are available, a watch that will
@@ -449,12 +390,12 @@ async fn main_loop() -> AnyResult<()> {
     }
     builder.init();
 
-    let db = Arc::new(foundationdb::Database::default()?);
+    let db = foundationdb::Database::default()?;
+    if args.clear {
+        Session::clear(&db, &args.room).await?;
+    }
 
     let session = Session::init(db, args.room, args.username).await?;
-    if args.clear {
-        session.clear().await?;
-    }
 
     {
         let sender = send_loop(&session);
@@ -480,7 +421,3 @@ async fn main() -> AnyResult<()> {
 
     result
 }
-
-// fn main() {
-//     tokio::runtime::Builder::hello_world().await?;
-// }

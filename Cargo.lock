@@ -394,7 +394,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fdb"
+name = "fdbchat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
