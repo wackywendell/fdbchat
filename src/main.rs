@@ -378,21 +378,6 @@ async fn send_loop(session: &Session) -> anyhow::Result<()> {
     }
 }
 
-// async fn handle_signals(mut signals: Signals) {
-//     while let Some(signal) = signals.next().await {
-//         match signal {
-//             SIGHUP => {
-//                 // Reload configuration
-//                 // Reopen the log file
-//             }
-//             SIGTERM | SIGINT | SIGQUIT => {
-//                 // Shutdown the system;
-//             },
-//             _ => unreachable!(),
-//         }
-//     }
-// }
-
 async fn signal_loop() -> anyhow::Result<()> {
     let mut signals = Signals::new(&[SIGHUP, SIGTERM, SIGINT, SIGQUIT])?;
     let handle = signals.handle();
